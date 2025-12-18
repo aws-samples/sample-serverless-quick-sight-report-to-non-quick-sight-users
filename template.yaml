@@ -1,0 +1,583 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  MaxConcurrentJobs:
+    Type: Number
+    Default: 5
+    Description: Maximum number of concurrent snapshot jobs
+    MinValue: 1
+    MaxValue: 20
+  SnapshotFunctionConcurrency:
+    Type: Number
+    Default: 100
+    Description: Concurrency limit for snapshot Lambda function
+    MinValue: 1
+    MaxValue: 1000
+  PollingFunctionConcurrency:
+    Type: Number
+    Default: 1
+    Description: Concurrency limit for polling Lambda function
+    MinValue: 1
+    MaxValue: 10
+  ApiStageName:
+    Type: String
+    Default: dev
+    Description: API Gateway stage name
+
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuickSightDynamoS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:StartDashboardSnapshotJob
+                  - quicksight:DescribeDashboardSnapshotJob
+                  - quicksight:DescribeDashboardSnapshotJobResult
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - s3:GeneratePresignedUrl
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:ListBucket
+                  - sqs:SendMessage
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dashboard/*"
+                  - !GetAtt QSAnonymousSnapshotJobs.Arn
+                  - !Sub "${SnapshotBucket.Arn}"
+                  - !Sub "${SnapshotBucket.Arn}/*"
+                  - !GetAtt SnapshotFunctionDLQ.Arn
+                  - !GetAtt PollingFunctionDLQ.Arn
+                  - !GetAtt LambdaEnvVarKMSKey.Arn
+
+  LambdaEnvVarKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Lambda environment variable and DynamoDB encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lambda service to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow DynamoDB service to use the key
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow SQS service to use the key
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs service to use the key
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+
+  LambdaEnvVarKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/lambda-env-vars-${AWS::StackName}"
+      TargetKeyId: !Ref LambdaEnvVarKMSKey
+
+  SnapshotBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "qs-anonymous-snapshots-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "qs-anonymous-snapshots-${AWS::AccountId}-${AWS::Region}"
+        LogFilePrefix: access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SnapshotBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SnapshotBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "${SnapshotBucket.Arn}"
+              - !Sub "${SnapshotBucket.Arn}/*"
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub "${SnapshotBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'AES256'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "${SnapshotBucket.Arn}"
+              - !Sub "${SnapshotBucket.Arn}/*"
+          - Sid: AllowQuickSightAccess
+            Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub "${SnapshotBucket.Arn}"
+              - !Sub "${SnapshotBucket.Arn}/*"
+
+  SnapshotFunctionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "qs-snapshot-function-dlq-${AWS::StackName}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref LambdaEnvVarKMSKey
+
+  PollingFunctionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "qs-polling-function-dlq-${AWS::StackName}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref LambdaEnvVarKMSKey
+
+  QSAnonymousSnapshotJobs:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: dashboardId
+          AttributeType: S
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: dashboardId
+          KeyType: HASH
+        - AttributeName: jobId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref LambdaEnvVarKMSKey
+
+  # Explicit API Gateway definition
+  QSAnonymousSnapshotApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: QSAnonymousSnapshotApi
+      Description: API for QuickSight Anonymous Snapshot operations
+
+  # API Resources
+  QSAnonymousSnapshotApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !GetAtt QSAnonymousSnapshotApi.RootResourceId
+      PathPart: qs-anonymous-snapshot
+
+  DescribeJobResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref QSAnonymousSnapshotApiResource
+      PathPart: describe_job
+
+  DescribeJobDashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DescribeJobResource
+      PathPart: "{dashboardId}"
+
+  DescribeJobJobIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DescribeJobDashboardResource
+      PathPart: "{jobId}"
+
+  DescribeJobResultResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref QSAnonymousSnapshotApiResource
+      PathPart: describe_job_result
+
+  DescribeJobResultDashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DescribeJobResultResource
+      PathPart: "{dashboardId}"
+
+  DescribeJobResultJobIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DescribeJobResultDashboardResource
+      PathPart: "{jobId}"
+
+  DownloadOutputResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref QSAnonymousSnapshotApiResource
+      PathPart: download_output
+
+  DownloadOutputDashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DownloadOutputResource
+      PathPart: "{dashboardId}"
+
+  DownloadOutputJobIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DownloadOutputDashboardResource
+      PathPart: "{jobId}"
+
+  DeleteDashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref QSAnonymousSnapshotApiResource
+      PathPart: "{dashboardId}"
+
+  DeleteJobIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ParentId: !Ref DeleteDashboardResource
+      PathPart: "{jobId}"
+
+  # API Methods
+  ListSnapshotJobsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref QSAnonymousSnapshotApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  CreateSnapshotJobMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref QSAnonymousSnapshotApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  DescribeSnapshotJobMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref DescribeJobJobIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  DescribeSnapshotJobResultMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref DescribeJobResultJobIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  DownloadOutputMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref DownloadOutputJobIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  DeleteSnapshotMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      ResourceId: !Ref DeleteJobIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QSAnonymousSnapshotFunction.Arn}/invocations"
+
+  QSAnonymousSnapshotApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ListSnapshotJobsMethod
+      - CreateSnapshotJobMethod
+      - DescribeSnapshotJobMethod
+      - DescribeSnapshotJobResultMethod
+      - DownloadOutputMethod
+      - DeleteSnapshotMethod
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+
+  QSAnonymousSnapshotApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref QSAnonymousSnapshotApi
+      DeploymentId: !Ref QSAnonymousSnapshotApiDeployment
+      StageName: !Ref ApiStageName
+      CacheClusterEnabled: true
+      CacheClusterSize: 0.5
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.requestTime $context.httpMethod $context.resourcePath $context.status $context.responseLength'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+
+  QSAnonymousSnapshotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: qs_anonymous_snapshot/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: !Ref SnapshotFunctionConcurrency
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt SnapshotFunctionDLQ.Arn
+      KmsKeyArn: !GetAtt LambdaEnvVarKMSKey.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref QSAnonymousSnapshotJobs
+          BUCKET_NAME: !Ref SnapshotBucket
+          BUCKET_REGION: !Ref AWS::Region
+          DashboardRegion: !Ref AWS::Region
+          MAX_CONCURRENT_JOBS: !Ref MaxConcurrentJobs
+
+  QSAnonymousSnapshotFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QSAnonymousSnapshotFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${QSAnonymousSnapshotApi}/*/*"
+
+  QSAnonymousSnapshotPolling:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: qs_anonymous_snapshot_polling/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: !Ref PollingFunctionConcurrency
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt PollingFunctionDLQ.Arn
+      KmsKeyArn: !GetAtt LambdaEnvVarKMSKey.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref QSAnonymousSnapshotJobs
+          BUCKET_NAME: !Ref SnapshotBucket
+          BUCKET_REGION: !Ref AWS::Region
+          DashboardRegion: !Ref AWS::Region
+          MAX_CONCURRENT_JOBS: !Ref MaxConcurrentJobs
+      Events:
+        PollingSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LambdaEnvVarKMSKey.Arn
+
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: QSAnonymousSnapshotApiStage
+    Properties:
+      UsagePlanName: QSAnonymousSnapshotUsagePlan
+      ApiStages:
+        - ApiId: !Ref QSAnonymousSnapshotApi
+          Stage: !Ref ApiStageName
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  QSAnonymoustSnapShotAPI:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot"
+  
+  APIEndpoints:
+    Description: "All API endpoints with methods"
+    Value: !Sub |
+      GET    https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot
+      POST   https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot
+      GET    https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot/describe_job/{dashboardId}/{jobId}
+      GET    https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot/describe_job_result/{dashboardId}/{jobId}
+      GET    https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot/download_output/{dashboardId}/{jobId}
+      DELETE https://${QSAnonymousSnapshotApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/qs-anonymous-snapshot/{dashboardId}/{jobId}
+  
+  ApiStageName:
+    Description: "API Gateway stage name"
+    Value: !Ref ApiStageName
+  
+  ApiKeyId:
+    Description: "API Key ID - retrieve the actual key value from AWS Console or CLI"
+    Value: !Ref ApiKey
+  
+  SnapshotFunctionDLQUrl:
+    Description: "Dead Letter Queue URL for Snapshot Function"
+    Value: !Ref SnapshotFunctionDLQ
+  
+  PollingFunctionDLQUrl:
+    Description: "Dead Letter Queue URL for Polling Function"
+    Value: !Ref PollingFunctionDLQ
+  
+  LambdaKMSKeyId:
+    Description: "KMS Key ID for Lambda environment variable encryption"
+    Value: !Ref LambdaEnvVarKMSKey
+  
+  LambdaKMSKeyAlias:
+    Description: "KMS Key Alias for Lambda environment variable encryption"
+    Value: !Ref LambdaEnvVarKMSKeyAlias
